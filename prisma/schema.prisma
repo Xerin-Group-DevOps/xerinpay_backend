@@ -1,0 +1,857 @@
+// XerinPay database schema.
+// Production datasource is PostgreSQL. See ../DATABASE.md for the entity
+// reference and ../TESTING.md for how this schema is exercised without a
+// live Postgres server in the sandbox environment.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity, RBAC (platform staff side)
+// ---------------------------------------------------------------------------
+
+model User {
+  id                String    @id @default(uuid())
+  publicId          String    @unique @default(uuid())
+  name              String
+  email             String    @unique
+  phone             String?
+  passwordHash      String
+  status            UserStatus @default(ACTIVE)
+  emailVerifiedAt   DateTime?
+  lastLoginAt       DateTime?
+  failedLoginCount  Int       @default(0)
+  lockedUntil       DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  roles             UserRole[]
+  merchantMemberships MerchantMember[]
+  ownedMerchants    Merchant[]        @relation("MerchantOwner")
+  sessions          Session[]
+  auditLogs         AuditLog[]
+  createdCredentials ApiCredential[]  @relation("CredentialCreator")
+  notifications     Notification[]
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  PENDING_VERIFICATION
+}
+
+model Role {
+  id          String   @id @default(uuid())
+  key         String   @unique // SUPER_ADMIN, ADMINISTRATOR, FINANCE, OPERATIONS, SUPPORT, DEVELOPER
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+
+  permissions RolePermission[]
+  users       UserRole[]
+}
+
+model Permission {
+  id          String   @id @default(uuid())
+  key         String   @unique // e.g. payments.read, payouts.create
+  description String?
+
+  roles       RolePermission[]
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+}
+
+model UserRole {
+  userId String
+  roleId String
+
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model EmailVerificationToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model Session {
+  id           String    @id @default(uuid())
+  userId       String
+  tokenHash    String    @unique
+  userAgent    String?
+  ipAddress    String?
+  createdAt    DateTime  @default(now())
+  lastActiveAt DateTime  @default(now())
+  expiresAt    DateTime
+  revokedAt    DateTime?
+
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Merchant / tenancy
+// ---------------------------------------------------------------------------
+
+model Merchant {
+  id            String        @id @default(uuid())
+  publicId      String        @unique @default(uuid())
+  businessName  String
+  legalName     String?
+  country       String        @default("TZ")
+  currency      String        @default("TZS")
+  status        MerchantStatus @default(PENDING)
+  kycStatus     KycStatus     @default(NOT_STARTED)
+  ownerUserId   String
+  contactEmail  String
+  contactPhone  String?
+  settings      Json          @default("{}")
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  owner         User             @relation("MerchantOwner", fields: [ownerUserId], references: [id])
+  members       MerchantMember[]
+  paymentProfiles PaymentProfile[]
+  kycProfile    KycProfile?
+  payouts       Payout[]
+  settlements   Settlement[]
+  ledgerAccounts LedgerAccount[]
+  feeRules      FeeRule[]
+  auditLogs     AuditLog[]
+  securityEvents SecurityEvent[]
+  apiRequestLogs ApiRequestLog[]
+
+  @@index([ownerUserId])
+}
+
+enum MerchantStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  DISABLED
+}
+
+enum KycStatus {
+  NOT_STARTED
+  PENDING
+  UNDER_REVIEW
+  VERIFIED
+  REJECTED
+}
+
+model MerchantMember {
+  id         String    @id @default(uuid())
+  merchantId String
+  userId     String
+  role       MemberRole @default(STAFF)
+  status     MemberStatus @default(ACTIVE)
+  invitedAt  DateTime  @default(now())
+  joinedAt   DateTime?
+  removedAt  DateTime?
+
+  merchant   Merchant  @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  profilePermissions MerchantMemberPermission[]
+
+  @@unique([merchantId, userId])
+  @@index([userId])
+}
+
+enum MemberRole {
+  OWNER
+  STAFF
+}
+
+enum MemberStatus {
+  ACTIVE
+  INVITED
+  REMOVED
+}
+
+// Scoped permission grants for merchant staff, optionally restricted to a
+// single Payment Profile. A null paymentProfileId means "all profiles".
+model MerchantMemberPermission {
+  id               String   @id @default(uuid())
+  memberId         String
+  paymentProfileId String?
+  permissionKey    String
+
+  member           MerchantMember  @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  paymentProfile   PaymentProfile? @relation(fields: [paymentProfileId], references: [id], onDelete: Cascade)
+
+  @@unique([memberId, paymentProfileId, permissionKey])
+}
+
+model KycProfile {
+  id               String     @id @default(uuid())
+  merchantId       String     @unique
+  status           KycStatus  @default(NOT_STARTED)
+  businessInfo     Json       @default("{}")
+  ownerInfo        Json       @default("{}")
+  rejectionReason  String?
+  submittedAt      DateTime?
+  reviewedAt       DateTime?
+  reviewedByUserId String?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  merchant         Merchant       @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  documents        KycDocument[]
+}
+
+model KycDocument {
+  id           String     @id @default(uuid())
+  kycProfileId String
+  type         String
+  fileName     String
+  storedPath   String
+  mimeType     String
+  sizeBytes    Int
+  uploadedAt   DateTime   @default(now())
+
+  kycProfile   KycProfile @relation(fields: [kycProfileId], references: [id], onDelete: Cascade)
+}
+
+// ---------------------------------------------------------------------------
+// Payment profiles (per business unit / app / site)
+// ---------------------------------------------------------------------------
+
+model PaymentProfile {
+  id              String   @id @default(uuid())
+  publicId        String   @unique @default(uuid())
+  merchantId      String
+  name            String
+  description     String?
+  logoUrl         String?
+  status          ProfileStatus @default(ACTIVE)
+  country         String   @default("TZ")
+  currency        String   @default("TZS")
+  allowedDomains  Json     @default("[]")
+  allowedPaymentMethods Json @default("[\"mobile_money\"]")
+  successUrl      String?
+  failureUrl      String?
+  cancelUrl       String?
+  supportEmail    String?
+  metadata        Json     @default("{}")
+  createdByUserId String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  merchant        Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  apiCredentials  ApiCredential[]
+  webhookEndpoints WebhookEndpoint[]
+  payments        Payment[]
+  customers       Customer[]
+  feeRules        FeeRule[]
+  memberPermissions MerchantMemberPermission[]
+  apiRequestLogs  ApiRequestLog[]
+  idempotencyKeys IdempotencyKey[]
+  settlements     Settlement[]
+
+  @@index([merchantId])
+}
+
+enum ProfileStatus {
+  ACTIVE
+  DISABLED
+}
+
+// ---------------------------------------------------------------------------
+// API credentials
+// ---------------------------------------------------------------------------
+
+model ApiCredential {
+  id               String    @id @default(uuid())
+  publicId         String    @unique @default(uuid())
+  merchantId       String
+  paymentProfileId String
+  environment      Environment
+  name             String
+  publicKey        String    @unique
+  secretKeyHash    String    @unique
+  secretKeyLastFour String
+  status           CredentialStatus @default(ACTIVE)
+  scopes           Json      @default("[]")
+  ipAllowlist      Json      @default("[]")
+  expiresAt        DateTime?
+  createdByUserId  String
+  lastUsedAt       DateTime?
+  lastRotatedAt    DateTime?
+  revokedAt        DateTime?
+  createdAt        DateTime  @default(now())
+
+  paymentProfile   PaymentProfile @relation(fields: [paymentProfileId], references: [id], onDelete: Cascade)
+  createdBy        User           @relation("CredentialCreator", fields: [createdByUserId], references: [id])
+  idempotencyKeys  IdempotencyKey[]
+  apiRequestLogs   ApiRequestLog[]
+
+  @@index([merchantId])
+  @@index([paymentProfileId])
+}
+
+enum Environment {
+  SANDBOX
+  PRODUCTION
+}
+
+enum CredentialStatus {
+  ACTIVE
+  REVOKED
+  EXPIRED
+}
+
+// ---------------------------------------------------------------------------
+// Customers
+// ---------------------------------------------------------------------------
+
+model Customer {
+  id               String   @id @default(uuid())
+  publicId         String   @unique @default(uuid())
+  merchantId       String
+  paymentProfileId String
+  name             String?
+  email            String?
+  phone            String?
+  metadata         Json     @default("{}")
+  createdAt        DateTime @default(now())
+
+  paymentProfile   PaymentProfile @relation(fields: [paymentProfileId], references: [id], onDelete: Cascade)
+  payments         Payment[]
+
+  @@index([paymentProfileId])
+  @@index([merchantId])
+}
+
+// ---------------------------------------------------------------------------
+// Payments / transactions / state machine
+// ---------------------------------------------------------------------------
+
+model Payment {
+  id                String   @id @default(uuid())
+  publicId          String   @unique @default(uuid())
+  merchantId        String
+  paymentProfileId  String
+  customerId        String?
+  environment       Environment
+  amountMinor       BigInt
+  currency          String
+  status            PaymentStatus @default(CREATED)
+  merchantReference String?
+  description       String?
+  paymentMethod     String?
+  successUrl        String?
+  failureUrl        String?
+  cancelUrl         String?
+  metadata          Json     @default("{}")
+  failureReason     String?
+  expiresAt         DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  paymentProfile    PaymentProfile @relation(fields: [paymentProfileId], references: [id], onDelete: Cascade)
+  customer          Customer?      @relation(fields: [customerId], references: [id])
+  transactions      Transaction[]
+  stateTransitions  PaymentStateTransition[]
+  refunds           Refund[]
+  ledgerEntries     LedgerEntry[]
+
+  @@index([paymentProfileId])
+  @@index([merchantId])
+  @@index([merchantReference])
+}
+
+enum PaymentStatus {
+  CREATED
+  PENDING
+  PROCESSING
+  SUCCESS
+  FAILED
+  CANCELLED
+  EXPIRED
+  REFUND_PENDING
+  PARTIALLY_REFUNDED
+  REFUNDED
+}
+
+model PaymentStateTransition {
+  id                String   @id @default(uuid())
+  paymentId         String
+  fromStatus        String
+  toStatus          String
+  reason            String?
+  actorType         String   // USER | SYSTEM | PROVIDER
+  actorId           String?
+  providerReference String?
+  createdAt         DateTime @default(now())
+
+  payment           Payment  @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@index([paymentId])
+}
+
+model Transaction {
+  id                String   @id @default(uuid())
+  publicId          String   @unique @default(uuid())
+  paymentId         String
+  providerKey       String
+  environment       Environment
+  providerReference String?
+  status            PaymentStatus
+  amountMinor       BigInt
+  currency          String
+  feeAmountMinor    BigInt   @default(0)
+  netAmountMinor    BigInt   @default(0)
+  paymentMethod     String?
+  rawResponse       Json?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  payment           Payment  @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@index([paymentId])
+  @@index([providerReference])
+}
+
+// ---------------------------------------------------------------------------
+// Ledger
+// ---------------------------------------------------------------------------
+
+model LedgerAccount {
+  id         String   @id @default(uuid())
+  publicId   String   @unique @default(uuid())
+  merchantId String?
+  type       LedgerAccountType
+  currency   String
+  createdAt  DateTime @default(now())
+
+  merchant   Merchant? @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  entries    LedgerEntry[]
+
+  @@unique([merchantId, type, currency])
+}
+
+enum LedgerAccountType {
+  MERCHANT_WALLET
+  PLATFORM_FEE_REVENUE
+  PLATFORM_SUSPENSE
+  PROVIDER_CLEARING
+}
+
+model LedgerEntry {
+  id              String   @id @default(uuid())
+  publicId        String   @unique @default(uuid())
+  ledgerAccountId String
+  direction       LedgerDirection
+  amountMinor     BigInt
+  currency        String
+  referenceType   String   // PAYMENT | REFUND | PAYOUT | FEE | ADJUSTMENT
+  referenceId     String
+  paymentId       String?
+  description     String?
+  createdAt       DateTime @default(now())
+
+  ledgerAccount   LedgerAccount @relation(fields: [ledgerAccountId], references: [id])
+  payment         Payment?      @relation(fields: [paymentId], references: [id])
+
+  @@index([ledgerAccountId])
+  @@index([referenceType, referenceId])
+}
+
+enum LedgerDirection {
+  DEBIT
+  CREDIT
+}
+
+// ---------------------------------------------------------------------------
+// Fees
+// ---------------------------------------------------------------------------
+
+model FeeRule {
+  id                String   @id @default(uuid())
+  merchantId        String?
+  paymentProfileId  String?
+  paymentMethod     String?
+  currency          String
+  percentageBps     Int      @default(0) // basis points, 100 = 1%
+  fixedAmountMinor  BigInt   @default(0)
+  minAmountMinor    BigInt?
+  maxAmountMinor    BigInt?
+  active            Boolean  @default(true)
+  priority          Int      @default(0)
+  createdAt         DateTime @default(now())
+
+  merchant          Merchant?       @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  paymentProfile    PaymentProfile? @relation(fields: [paymentProfileId], references: [id], onDelete: Cascade)
+}
+
+// ---------------------------------------------------------------------------
+// Refunds / payouts / settlements
+// ---------------------------------------------------------------------------
+
+model Refund {
+  id                String   @id @default(uuid())
+  publicId          String   @unique @default(uuid())
+  paymentId         String
+  amountMinor       BigInt
+  currency          String
+  reason            String?
+  status            RefundStatus @default(PENDING)
+  providerReference String?
+  requestedByUserId String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  payment           Payment  @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@index([paymentId])
+}
+
+enum RefundStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+model Payout {
+  id                String   @id @default(uuid())
+  publicId          String   @unique @default(uuid())
+  merchantId        String
+  amountMinor       BigInt
+  feeAmountMinor    BigInt   @default(0)
+  currency          String
+  destination       Json
+  status            PayoutStatus @default(PENDING)
+  providerReference String?
+  requestedByUserId String
+  approvedByUserId  String?
+  failureReason     String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  merchant          Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@index([merchantId])
+}
+
+enum PayoutStatus {
+  PENDING
+  APPROVED
+  PROCESSING
+  COMPLETED
+  FAILED
+  REJECTED
+}
+
+model Settlement {
+  id                String   @id @default(uuid())
+  publicId          String   @unique @default(uuid())
+  merchantId        String
+  paymentProfileId  String?
+  grossAmountMinor  BigInt
+  feesMinor         BigInt
+  refundsMinor      BigInt
+  netAmountMinor    BigInt
+  currency          String
+  settlementDate    DateTime
+  providerReference String?
+  createdAt         DateTime @default(now())
+
+  merchant          Merchant        @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  paymentProfile    PaymentProfile? @relation(fields: [paymentProfileId], references: [id])
+
+  @@index([merchantId])
+}
+
+// ---------------------------------------------------------------------------
+// Providers
+// ---------------------------------------------------------------------------
+
+model Provider {
+  id           String   @id @default(uuid())
+  key          String   @unique // selcom, azampay, sandbox
+  name         String
+  status       ProviderStatus @default(ACTIVE)
+  capabilities Json     @default("[]")
+  priority     Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  credentials  ProviderCredential[]
+}
+
+enum ProviderStatus {
+  ACTIVE
+  DISABLED
+}
+
+model ProviderCredential {
+  id               String   @id @default(uuid())
+  providerId       String
+  environment      Environment
+  encryptedConfig  String   // AES-256-GCM encrypted JSON blob
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  provider         Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@unique([providerId, environment])
+}
+
+// ---------------------------------------------------------------------------
+// Webhooks (outbound, to merchants)
+// ---------------------------------------------------------------------------
+
+model WebhookEndpoint {
+  id                String   @id @default(uuid())
+  publicId          String   @unique @default(uuid())
+  paymentProfileId  String
+  url               String
+  encryptedSecret   String   // AES-256-GCM encrypted signing secret
+  status            WebhookEndpointStatus @default(ACTIVE)
+  subscribedEvents  Json     @default("[]")
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  paymentProfile    PaymentProfile @relation(fields: [paymentProfileId], references: [id], onDelete: Cascade)
+  deliveries        WebhookDelivery[]
+
+  @@index([paymentProfileId])
+}
+
+enum WebhookEndpointStatus {
+  ACTIVE
+  DISABLED
+}
+
+model WebhookDelivery {
+  id                String   @id @default(uuid())
+  publicId          String   @unique @default(uuid())
+  webhookEndpointId String
+  eventType         String
+  eventId           String
+  payload           Json
+  status            WebhookDeliveryStatus @default(PENDING)
+  attempt           Int      @default(0)
+  responseStatus    Int?
+  responseLatencyMs Int?
+  responseBodySnippet String?
+  lastAttemptAt     DateTime?
+  nextRetryAt       DateTime?
+  createdAt         DateTime @default(now())
+
+  webhookEndpoint   WebhookEndpoint @relation(fields: [webhookEndpointId], references: [id], onDelete: Cascade)
+
+  @@index([webhookEndpointId])
+  @@index([eventId])
+}
+
+enum WebhookDeliveryStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  EXHAUSTED
+}
+
+// ---------------------------------------------------------------------------
+// API observability
+// ---------------------------------------------------------------------------
+
+model ApiRequestLog {
+  id               String   @id @default(uuid())
+  requestId        String
+  merchantId       String?
+  paymentProfileId String?
+  apiCredentialId  String?
+  environment      Environment?
+  method           String
+  path             String
+  statusCode       Int
+  latencyMs        Int
+  ipAddress        String?
+  createdAt        DateTime @default(now())
+
+  merchant         Merchant?       @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  paymentProfile   PaymentProfile? @relation(fields: [paymentProfileId], references: [id], onDelete: Cascade)
+  apiCredential    ApiCredential?  @relation(fields: [apiCredentialId], references: [id], onDelete: Cascade)
+
+  @@index([merchantId])
+  @@index([paymentProfileId])
+  @@index([requestId])
+}
+
+model IdempotencyKey {
+  id               String   @id @default(uuid())
+  merchantId       String
+  paymentProfileId String
+  apiCredentialId  String?
+  endpoint         String
+  key              String
+  requestHash      String
+  status           IdempotencyStatus @default(IN_PROGRESS)
+  responseStatus   Int?
+  responseBody     Json?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  paymentProfile   PaymentProfile @relation(fields: [paymentProfileId], references: [id], onDelete: Cascade)
+  apiCredential    ApiCredential? @relation(fields: [apiCredentialId], references: [id])
+
+  @@unique([paymentProfileId, endpoint, key])
+}
+
+enum IdempotencyStatus {
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+}
+
+// ---------------------------------------------------------------------------
+// Notifications / email
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id         String   @id @default(uuid())
+  userId     String?
+  merchantId String?
+  type       String
+  title      String
+  body       String
+  channel    NotificationChannel @default(IN_APP)
+  readAt     DateTime?
+  createdAt  DateTime @default(now())
+
+  user       User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+}
+
+model EmailTemplate {
+  id        String   @id @default(uuid())
+  key       String   @unique
+  subject   String
+  bodyHtml  String
+  bodyText  String
+  enabled   Boolean  @default(true)
+  updatedAt DateTime @updatedAt
+}
+
+model EmailLog {
+  id              String   @id @default(uuid())
+  templateKey     String
+  toEmail         String
+  subject         String
+  status          EmailStatus
+  providerMessageId String?
+  error           String?
+  createdAt       DateTime @default(now())
+}
+
+enum EmailStatus {
+  SENT
+  FAILED
+  SKIPPED_NOT_CONFIGURED
+}
+
+// ---------------------------------------------------------------------------
+// Audit & security
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id           String   @id @default(uuid())
+  publicId     String   @unique @default(uuid())
+  actorUserId  String?
+  actorType    String   // USER | API_CREDENTIAL | SYSTEM
+  action       String
+  entityType   String
+  entityId     String?
+  merchantId   String?
+  ipAddress    String?
+  requestId    String?
+  metadata     Json     @default("{}")
+  createdAt    DateTime @default(now())
+
+  actor        User?     @relation(fields: [actorUserId], references: [id])
+  merchant     Merchant? @relation(fields: [merchantId], references: [id])
+
+  @@index([merchantId])
+  @@index([actorUserId])
+  @@index([entityType, entityId])
+}
+
+model SecurityEvent {
+  id          String   @id @default(uuid())
+  publicId    String   @unique @default(uuid())
+  type        String
+  severity    SecuritySeverity @default(LOW)
+  actorUserId String?
+  merchantId  String?
+  ipAddress   String?
+  requestId   String?
+  metadata    Json     @default("{}")
+  createdAt   DateTime @default(now())
+
+  merchant    Merchant? @relation(fields: [merchantId], references: [id])
+
+  @@index([merchantId])
+  @@index([type])
+}
+
+enum SecuritySeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+model SystemSetting {
+  id              String   @id @default(uuid())
+  key             String   @unique
+  value           Json
+  category        String
+  isSensitive     Boolean  @default(false)
+  updatedAt       DateTime @updatedAt
+  updatedByUserId String?
+}
